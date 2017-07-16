@@ -21,11 +21,10 @@ use winapi::CW_USEDEFAULT;
 use winapi::WS_EX_CLIENTEDGE;
 use std::mem;
 
-
 use winapi::winuser::WS_OVERLAPPEDWINDOW;
 use winapi::winuser::WS_VISIBLE;
 use winapi::winuser::WNDCLASSW;
-
+use std::sync::{Arc, RwLock, Mutex,Once, ONCE_INIT};
 use std::ffi::OsStr;
 use std::io::Error;
 use std::iter::once;
@@ -103,7 +102,7 @@ trait Child:Component{
     
 }
 trait Container{
-    fn add<T:Child +Sized + 'static>(&mut self,name:&str, component:T);
+    fn add<T:Child +Sized + 'static>(&self,name:&str, component:T);
     fn find_child<T:Child>(&self, name:&str)->Option<&T>;
 }
 trait Sizer{
@@ -111,35 +110,147 @@ trait Sizer{
 }
 trait EventHandlable{
     fn on_message(&self, msg:UINT,wparam:WPARAM, lparam:LPARAM)->Option<LRESULT>;
-    fn add(&self, handler:WindowEventHandler);
+    fn connect(&self, handler:WindowEvent);
 }
-enum WindowEventHandler{
-    OnPaint{
-        handler:Box<Fn(&Window)>
+struct PaintEvent{
+
+}
+struct MouseEvent{
+    mouse_pos:Point
+}
+impl MouseEvent{
+    fn new(mouse_pos:Point)->MouseEvent{
+        MouseEvent{mouse_pos:mouse_pos}
     }
+    fn get_position(&self)->Point{
+        self.mouse_pos.clone()
+    }
+}
+enum WindowEvent{
+    OnPaint(Box<Fn(&Window, &mut PaintEvent)>),
+    OnMouseMove(Box<Fn(&Window, &mut MouseEvent)>)
+}
+impl WindowEvent{
+    fn paint<T:'static+ Fn(&Window, &mut PaintEvent)>( it:T)->WindowEvent{
+        WindowEvent::OnPaint(Box::new(it))
+    }
+    fn mousemove<T:'static+ Fn(&Window, &mut MouseEvent)>( it:T)->WindowEvent{
+        WindowEvent::OnMouseMove(Box::new(it))
+    }
+}
+trait WindowInitializer{
+    fn init(&self, window:&Window);
 }
 struct Window
 {
     control:CommonWindowControl,
-    children:Dict<String, Box<Child>>,
-    handler:std::sync::RwLock<Vec<WindowEventHandler>>
+    children:RwLock<Dict<String, Box<Child>>>,
+    handler:RwLock<Vec<WindowEvent>>
+}
+impl Window{
+    fn create<Initializer:WindowInitializer + 'static>(system:&System, opt:WindowOpt, initializer:&Initializer)->bool{
+        let class_name = to_wide("dm-gui-rm-window");
+        let title = if let Some(v) = opt.title{
+            to_wstring(v.as_str())
+        }
+        else{
+            to_wstring("")
+        };
+        let (cx, cy) = if let Some(v) = opt.size{
+            (v.get_width(), v.get_height())
+        }
+        else{
+            (CW_USEDEFAULT, CW_USEDEFAULT)
+        };
+        let (x,y) = if let Some(v) = opt.position{
+            (v.get_x(), v.get_y())
+        }
+        else{
+            (CW_USEDEFAULT, CW_USEDEFAULT)
+        };
+        let h_wnd_window = unsafe{
+            user32::CreateWindowExW(0, class_name.as_ptr(), 
+                title.as_ptr(), WS_OVERLAPPEDWINDOW, 
+                x, y, cx, cy, 0 as HWND, 0 as HMENU, 0 as HINSTANCE, std::ptr::null_mut())
+        };
+        if h_wnd_window as u64== 0{
+            return false;
+        }
+        else{
+            let win =Box::new(Window{
+                children:RwLock::new(Dict::new()),
+                handler:RwLock::new(Vec::new()),
+                control:CommonWindowControl{
+                    hwnd:h_wnd_window
+                }
+            });
+            unsafe{
+                let hi = std::mem::transmute::<&EventHandlable,[winapi::HANDLE; 2]>(win.as_ref());
+                user32::SetPropW(h_wnd_window,TEXT("a").as_ptr(), hi[0]);
+                user32::SetPropW(h_wnd_window,TEXT("b").as_ptr(), hi[1]);
+            }
+            initializer.init(&win);
+            let mut v = system.windows.write().unwrap();
+            v.push(win);
+            
+            return true;
+        }
+    }
 }
 impl EventHandlable for Window{
-    fn add(&self, handler:WindowEventHandler){
+    fn connect(&self, handler:WindowEvent){
         let mut writer = self.handler.write().unwrap();
         writer.push(handler);
     }
     fn on_message(&self, msg:UINT,wparam:WPARAM, lparam:LPARAM)->Option<LRESULT>{
+        let reader =match self.handler.read(){
+            Ok(v)=>v,
+            Err(e)=>{
+                println!("{:?}",e);
+                return None;
+            }
+        };
+        match msg{
+            winapi::winuser::WM_PAINT=>{
+                for it in reader.iter(){
+                    match *it{
+                        WindowEvent::OnPaint(ref handler)=>{
+                            handler(self, &mut PaintEvent{});
+                            return Some(0);
+                        },
+                        _=>{}
+                    }
+                };
+            }
+            winapi::winuser::WM_MOUSEMOVE=>{
+                let x = winapi::windowsx::GET_X_LPARAM(lparam);
+                let y = winapi::windowsx::GET_Y_LPARAM(lparam);
+                
+                let mut event = MouseEvent::new(Point::new(x,y));
+                for it in reader.iter(){
+                    match *it{
+                        WindowEvent::OnMouseMove(ref handler)=>{
+                            handler(self, &mut event);
+                            return Some(0);
+                        },
+                        _=>{}
+                    }
+                };
+            }
+            _=>{}
+        }
         return None;
     }
 }
 impl Container for Window{
-    fn add<T:Child +Sized + 'static>(&mut self, name:&str, component:T){
+    fn add<T:Child +Sized + 'static>(&self, name:&str, component:T){
         //TODO:
-        self.children.insert(String::from(name),Box::new(component));
+        let mut chwrite = self.children.write().unwrap();
+        chwrite.insert(String::from(name),Box::new(component));
     }
     fn find_child<T:Child>(&self, name:&str)->Option<&T>{
-        if let Some(v) = self.children.get(name){
+        let chreader = self.children.read().unwrap();
+        if let Some(v) = chreader.get(name){
             let rs =unsafe{std::mem::transmute::<&Box<Child>, &Box<T>>(v)};
             return Some(rs.as_ref());
         }
@@ -167,82 +278,36 @@ impl Component for Window{
         return self.control.set_position(pos);
     }
 }
-struct WindowBuilder{
-    hinstance:HINSTANCE,
+struct WindowOpt{
     topmost:Option<bool>,
     position:Option<Point>,
     size:Option<Size>,
     title:Option<String>
 }
-impl WindowBuilder{
-    fn new(system:&System)->WindowBuilder{
-        WindowBuilder{
-            hinstance:system.hinstance,
+impl WindowOpt{
+    fn new()->WindowOpt{
+        WindowOpt{
             topmost:None,
             position:None,
             size:None,
             title:None
         }
     }
-    fn is_topmost(mut self, value:bool)->WindowBuilder{
+    fn is_topmost(mut self, value:bool)->WindowOpt{
         self.topmost = Some(value);
         return self;
     }
-    fn position(mut self, value:Point)->WindowBuilder{
+    fn position(mut self, value:Point)->WindowOpt{
         self.position = Some(value);
         return self;
     }
-    fn size(mut self, value:Size)->WindowBuilder{
+    fn size(mut self, value:Size)->WindowOpt{
         self.size = Some(value);
         return self;
     }
-    fn title(mut self, value:&str)->WindowBuilder{
+    fn title(mut self, value:&str)->WindowOpt{
         self.title = Some(String::from(value));
         return self;
-    }
-    fn build(self)->Result<Window, ()>{
-        let class_name = to_wide("dm-gui-rm-window");
-        let title = if let Some(v) = self.title{
-            to_wstring(v.as_str())
-        }
-        else{
-            to_wstring("")
-        };
-        let (cx, cy) = if let Some(v) = self.size{
-            (v.get_width(), v.get_height())
-        }
-        else{
-            (CW_USEDEFAULT, CW_USEDEFAULT)
-        };
-        let (x,y) = if let Some(v) = self.position{
-            (v.get_x(), v.get_y())
-        }
-        else{
-            (CW_USEDEFAULT, CW_USEDEFAULT)
-        };
-        let h_wnd_window = unsafe{
-            user32::CreateWindowExW(0, class_name.as_ptr(), 
-                title.as_ptr(), WS_OVERLAPPEDWINDOW, 
-                x, y, cx, cy, 0 as HWND, 0 as HMENU, 0 as HINSTANCE, std::ptr::null_mut())
-        };
-        if h_wnd_window as u64== 0{
-            return Err(());
-        }
-        else{
-            let win = Window{
-                children:Dict::new(),
-                handler:std::sync::RwLock::new(Vec::new()),
-                control:CommonWindowControl{
-                    hwnd:h_wnd_window
-                }
-            };
-            unsafe{
-                let hi = std::mem::transmute::<&EventHandlable,[winapi::HANDLE; 2]>(&win);
-                user32::SetPropW(h_wnd_window,TEXT("a").as_ptr(), hi[0]);
-                user32::SetPropW(h_wnd_window,TEXT("b").as_ptr(), hi[1]);
-            }
-            return Ok(win);
-        }
     }
 }
 struct CommonWindowControl{
@@ -287,11 +352,11 @@ enum ButtonEvent{
 struct Button{
     control:CommonWindowControl
 }
+
 impl Button{
-    fn create<Parent:Container + WindowComponent>(parent:&mut Parent, name:&'static str, text:&str)->bool{
+    fn create<Parent:Container + WindowComponent>(parent:&Parent, name:&'static str, text:&str)->bool{
         let parent_hwnd = parent.get_hwnd();
         
-        println!("{}",parent_hwnd as u64);
         let hwnd = unsafe{
             user32::CreateWindowExW(0,TEXT("button").as_ptr(),TEXT(text).as_ptr(),winapi::winuser::WS_CHILD | winapi::winuser::BS_PUSHBUTTON, 0,0,50,100,parent_hwnd,0 as HMENU, 0 as HINSTANCE, std::ptr::null_mut())
         };
@@ -310,9 +375,9 @@ impl Button{
     }
 }
 impl Button{
-    fn set_title(&self, title:&str){
+    fn set_text(&self, title:&str){
         unsafe{
-
+            user32::SetWindowTextW(self.control.get_hwnd(), TEXT(title).as_ptr());
         }
     }
 }
@@ -368,7 +433,6 @@ impl Component for TextEdit{
     
 }
 pub unsafe extern "system" fn win_proc(h_wnd :HWND, msg :UINT, w_param :WPARAM, l_param :LPARAM ) -> LRESULT {
-    
     let handler:&EventHandlable = unsafe{
         let mut t:[winapi::HANDLE;2]=[
             user32::GetPropW(h_wnd, TEXT("a").as_ptr()),
@@ -379,34 +443,67 @@ pub unsafe extern "system" fn win_proc(h_wnd :HWND, msg :UINT, w_param :WPARAM, 
         }
         std::mem::transmute::<[winapi::HANDLE;2],&EventHandlable>(t)
     };
+    if winapi::winuser::WM_DESTROY == msg{
+        let system = singleton().inner;
+        let mut write = system.windows.write().unwrap();
+        //println!("{}",write.len());
+        {
+            let hwnd = h_wnd;
+            let l = write.len();
+            for i in 0..l{
+                let b = write.get(i).unwrap().get_hwnd();
+                if b == hwnd{
+                    write.remove(i);
+                    return 0;
+                }
+            }
+        }
+    }
     if let Some(v) =handler.on_message(msg, w_param,l_param){
         return v;
     }
     else{
         return user32::DefWindowProcW(h_wnd, msg, w_param, l_param);
     }
-    match msg{
-        winapi::winuser::WM_DESTROY=>{
-            user32::PostQuitMessage(0);
-        },
-        winapi::winuser::WM_COMMAND=>{
-            if l_param != 0{
-                let hwnd = l_param as HWND;
-            }
-        },
-        _=>{
-            
-        }
-    }
-    return 0;
+}
+#[derive(Clone)]
+struct SystemReader {
+    // Since we will be used in many threads, we need to protect
+    // concurrent access
+    inner: Arc<System>
 }
 
+fn singleton() -> SystemReader {
+    // Initialize it to a null value
+    static mut SINGLETON: *const SystemReader = 0 as *const SystemReader;
+    static ONCE: Once = ONCE_INIT;
+
+    unsafe {
+        ONCE.call_once(|| {
+            // Make it
+            let singleton = SystemReader {
+                inner: Arc::new(System{
+                    hinstance:0 as HMODULE,
+                    windows:Arc::new(RwLock::new(Vec::new()))
+                })
+            };
+
+            // Put it in the heap so it can outlive this call
+            SINGLETON = mem::transmute(Box::new(singleton));
+        });
+
+        // Now we give out a copy of the data that is safe to use concurrently.
+        (*SINGLETON).clone()
+    }
+}
 #[derive(Clone)]
 struct System{
-    hinstance:HMODULE
+    hinstance:HMODULE,
+    windows:Arc<RwLock<Vec<Box<Window>>>>
 }
+
 impl System{
-    fn init()->Result<System, ()>{
+    fn init()->Result<SystemReader,()>{
         
         let hmodule:HMODULE = unsafe{
             kernel32::GetModuleHandleW(0 as *const u16)
@@ -436,11 +533,12 @@ impl System{
         }
         //hide_console_window();
         let res = System{
+            windows:Arc::new(RwLock::new(Vec::new())),
             hinstance:hmodule
         };
-        return Ok(res);
+        return Ok(singleton());
     }
-    fn message_loop(){
+    fn message_loop(&self){
         unsafe 
         {
             let mut msg = winapi::winuser::MSG {
@@ -457,32 +555,53 @@ impl System{
                 if pm == 0 {
                     break;
                 }
-
+                
                 if msg.message == winapi::winuser::WM_QUIT {
                     break;
                 }
-
                 user32::TranslateMessage(&mut msg);
                 user32::DispatchMessageW(&mut msg);
+                //println!("{:X}",msg.message);
+                let is_quick = {self.windows.read().unwrap().len() == 0};
+                if is_quick{
+                    user32::PostQuitMessage(0);
+                }
             }
         }
     }
 }
+struct Init{
+
+}
+impl WindowInitializer for Init{
+    fn init(&self, window:&Window){
+        window.show();
+        Button::create(window,"id_button_1", "button1");
+        Button::create(window,"id_button_2", "button2");
+        let btn:&Button = window.find_child::<Button>("id_button_1").unwrap();
+        //let btn2:&Button = window.find_child::<Button>("id_button_2").unwrap();
+        btn.show();
+        //btn2.show();
+        btn.set_size(Size::new(400,200));
+        btn.set_position(Point::new(0,0));
+        //btn2.set_position(Point::new(400,0));
+        //btn2.set_size(Size::new(400,200));
+        btn.set_text(&format!("XY"));
+        window.connect(WindowEvent::mousemove(|window, event|{
+            let pos = event.get_position();
+            let btn:&Button = window.find_child::<Button>("id_button_1").unwrap();
+            btn.set_text(&format!("X:{}, Y:{}",pos.get_x(), pos.get_y()));
+        }));
+    }
+}
 
 fn main() {
+    println!("{}",mem::size_of::<Window>());
+    println!("{}",mem::size_of::<&Window>());
+    println!("{}",mem::size_of::<&EventHandlable>());
       // Here our unsafe code goes - 
-    println!("{}",mem::size_of::<&Component>());
-    let system = System::init().unwrap();
-    let mut window = WindowBuilder::new(&system).title("Rust Window").build().unwrap();
-    window.show();
-    Button::create(&mut window,"id_button_1", "button1");
-    Button::create(&mut window,"id_button_2", "button2");
-    let btn:&Button = window.find_child::<Button>("id_button_1").unwrap();
-    let btn2:&Button = window.find_child::<Button>("id_button_2").unwrap();
-    btn.show();
-    btn2.show();
-    btn.set_size(Size::new(400,600));
-    btn2.set_position(Point::new(0,0));
-    btn2.set_position(Point::new(400,0));
-    System::message_loop();
+    let a = System::init().unwrap();
+    let winopt = WindowOpt::new().title("Rust Window");
+    Window::create(&a.inner, winopt,&Init{});
+    a.inner.message_loop();
 }
