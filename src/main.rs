@@ -5,25 +5,10 @@ use winapi::windef::{HWND,RECT};
 use winapi::minwindef::HMODULE;
 use user32::GetWindowRect;
 
-use winapi::LRESULT;
-use winapi::LPARAM;
-use winapi::WPARAM;
-use winapi::UINT;
-use winapi::LPCWSTR;
-use winapi::HBRUSH;
-use winapi::HINSTANCE;
-use winapi::HICON;
-use winapi::HCURSOR;
-use winapi::HMENU;
-use winapi::SW_SHOWNORMAL;
-use winapi::DWORD;
-use winapi::CW_USEDEFAULT;
-use winapi::WS_EX_CLIENTEDGE;
-use std::mem;
+use winapi::{LRESULT,LPARAM,WPARAM,UINT,LPCWSTR,HBRUSH,HINSTANCE,HICON,HCURSOR,HMENU,SW_SHOWNORMAL,DWORD,CW_USEDEFAULT,WS_EX_CLIENTEDGE};
+use winapi::winuser::{WS_OVERLAPPEDWINDOW,WS_VISIBLE,WNDCLASSW};
 
-use winapi::winuser::WS_OVERLAPPEDWINDOW;
-use winapi::winuser::WS_VISIBLE;
-use winapi::winuser::WNDCLASSW;
+use std::mem;
 use std::sync::{Arc, RwLock, Mutex,Once, ONCE_INIT};
 use std::ffi::OsStr;
 use std::io::Error;
@@ -98,7 +83,7 @@ trait Component{
 trait WindowComponent{
     fn get_hwnd(&self)->HWND;
 }
-trait Child:Component{
+trait Child:Component + WindowComponent{
     
 }
 trait Container{
@@ -118,6 +103,9 @@ struct PaintEvent{
 struct MouseEvent{
     mouse_pos:Point
 }
+struct Event{
+
+}
 impl MouseEvent{
     fn new(mouse_pos:Point)->MouseEvent{
         MouseEvent{mouse_pos:mouse_pos}
@@ -128,7 +116,8 @@ impl MouseEvent{
 }
 enum WindowEvent{
     OnPaint(Box<Fn(&Window, &mut PaintEvent)>),
-    OnMouseMove(Box<Fn(&Window, &mut MouseEvent)>)
+    OnMouseMove(Box<Fn(&Window, &mut MouseEvent)>),
+    OnButtonClick(String, Box<Fn(&Window, &mut Event)>)
 }
 impl WindowEvent{
     fn paint<T:'static+ Fn(&Window, &mut PaintEvent)>( it:T)->WindowEvent{
@@ -137,9 +126,9 @@ impl WindowEvent{
     fn mousemove<T:'static+ Fn(&Window, &mut MouseEvent)>( it:T)->WindowEvent{
         WindowEvent::OnMouseMove(Box::new(it))
     }
-}
-trait WindowInitializer{
-    fn init(&self, window:&Window);
+    fn button_click<T:'static+ Fn(&Window, &mut Event)>(name:&str, f:T)->WindowEvent{
+        WindowEvent::OnButtonClick(String::from(name), Box::new(f))
+    }
 }
 struct Window
 {
@@ -148,7 +137,7 @@ struct Window
     handler:RwLock<Vec<WindowEvent>>
 }
 impl Window{
-    fn create<Initializer:WindowInitializer + 'static>(system:&System, opt:WindowOpt, initializer:&Initializer)->bool{
+    fn create<Initializer:Fn(&Window)>(system:&System, opt:WindowOpt, initializer:Initializer)->bool{
         let class_name = to_wide("dm-gui-rm-window");
         let title = if let Some(v) = opt.title{
             to_wstring(v.as_str())
@@ -189,11 +178,16 @@ impl Window{
                 user32::SetPropW(h_wnd_window,TEXT("a").as_ptr(), hi[0]);
                 user32::SetPropW(h_wnd_window,TEXT("b").as_ptr(), hi[1]);
             }
-            initializer.init(&win);
+            initializer(&win);
             let mut v = system.windows.write().unwrap();
             v.push(win);
             
             return true;
+        }
+    }
+    fn show_message(&self, title:&str, text:&str){
+        unsafe{
+            user32::MessageBoxW(self.get_hwnd(), TEXT(text).as_ptr(), TEXT(title).as_ptr(), 0);
         }
     }
 }
@@ -211,6 +205,27 @@ impl EventHandlable for Window{
             }
         };
         match msg{
+            winapi::winuser::WM_COMMAND=>{
+                let children = self.children.read().unwrap();
+                println!("LINE:let children = self.children.read().unwrap();");
+                for (key, it) in children.iter(){
+                    let h =unsafe{std::mem::transmute::<&Box<Child>, &Box<Button>>(it)};
+                    println!("h is {:x} hwnd is {:x}",h.get_hwnd() as LPARAM, lparam);
+                    if lparam as HWND == h.get_hwnd(){
+                        println!("LINE:if lparam as HWND == h.get_hwnd(){{");
+                        for it in reader.iter(){
+                           match *it{
+                                WindowEvent::OnButtonClick(ref name, ref handler)=>if key == name{
+                                    handler(self, &mut Event{});
+                                    return Some(0);
+                                },
+                                _=>{}
+                            }
+                       }
+                       break;
+                    }
+                }
+            },
             winapi::winuser::WM_PAINT=>{
                 for it in reader.iter(){
                     match *it{
@@ -408,7 +423,26 @@ impl Component for Button{
 struct TextEdit{
     control:CommonWindowControl
 }
-
+impl TextEdit{
+    fn create<Parent:Container + WindowComponent>(parent:&Parent, name:&'static str)->bool{
+        let parent_hwnd = parent.get_hwnd();
+        let hwnd = unsafe{
+            user32::CreateWindowExW(0,TEXT("edit").as_ptr(),std::ptr::null_mut(),winapi::winuser::WS_CHILD | winapi::winuser::WS_BORDER, 0,0,50,100,parent_hwnd,0 as HMENU, 0 as HINSTANCE, std::ptr::null_mut())
+        };
+        if hwnd as u64 == 0{
+            return false;
+        }
+        else{
+            let button= Button{
+                control:CommonWindowControl{
+                    hwnd:hwnd
+                }
+            };
+            parent.add(name, button);
+            return true;
+        }
+    }
+}
 impl Child for TextEdit{
 
 }
@@ -518,7 +552,7 @@ impl System{
                 style: 0,
                 lpfnWndProc: Some(win_proc), 
                 cbClsExtra: 0,
-                cbWndExtra: mem::size_of::<&EventHandlable>() as i32,
+                cbWndExtra: 0,
                 hInstance: 0 as HINSTANCE,
                 hIcon: user32::LoadIconW(0 as HINSTANCE, winapi::winuser::IDI_APPLICATION),
                 hCursor: user32::LoadCursorW(0 as HINSTANCE, winapi::winuser::IDI_APPLICATION),
@@ -570,15 +604,19 @@ impl System{
         }
     }
 }
-struct Init{
 
-}
-impl WindowInitializer for Init{
-    fn init(&self, window:&Window){
+fn main() {
+      // Here our unsafe code goes - 
+    let a = System::init().unwrap();
+    let winopt = WindowOpt::new().title("Rust Window");
+    Window::create(&a.inner, winopt,|window|{
         window.show();
         Button::create(window,"id_button_1", "button1");
         Button::create(window,"id_button_2", "button2");
+        TextEdit::create(window,"id_text");
         let btn:&Button = window.find_child::<Button>("id_button_1").unwrap();
+        let text_edit:&TextEdit = window.find_child::<TextEdit>("id_text").unwrap();
+        println!("btn is {:x}",btn.get_hwnd() as LPARAM);
         //let btn2:&Button = window.find_child::<Button>("id_button_2").unwrap();
         btn.show();
         //btn2.show();
@@ -587,21 +625,17 @@ impl WindowInitializer for Init{
         //btn2.set_position(Point::new(400,0));
         //btn2.set_size(Size::new(400,200));
         btn.set_text(&format!("XY"));
+        text_edit.show();
+        text_edit.set_size(Size::new(400,25));
+        text_edit.set_position(Point::new(400,0));
         window.connect(WindowEvent::mousemove(|window, event|{
             let pos = event.get_position();
             let btn:&Button = window.find_child::<Button>("id_button_1").unwrap();
             btn.set_text(&format!("X:{}, Y:{}",pos.get_x(), pos.get_y()));
         }));
-    }
-}
-
-fn main() {
-    println!("{}",mem::size_of::<Window>());
-    println!("{}",mem::size_of::<&Window>());
-    println!("{}",mem::size_of::<&EventHandlable>());
-      // Here our unsafe code goes - 
-    let a = System::init().unwrap();
-    let winopt = WindowOpt::new().title("Rust Window");
-    Window::create(&a.inner, winopt,&Init{});
+        window.connect(WindowEvent::button_click("id_button_1",|window, event|{
+            window.show_message("알림","버튼1이 눌렸습니다.");
+        }));
+    });
     a.inner.message_loop();
 }

@@ -4,9 +4,6 @@ version = "0.1.0"
 authors = ["Damezuma <qweads12@gmail.com>"]
 
 [dependencies]
-gfx = "0.14"
-glutin = "0.7"
-gfx_window_glutin = "0.14"
 winapi = "0.2.8"
 user32-sys = "0.2.0"
 kernel32-sys = "0.2.2"
