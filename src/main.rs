@@ -93,6 +93,9 @@ trait Container{
 trait Sizer{
     fn layout<T:Child +Sized>(&self, children:&Vec<T>);
 }
+
+
+
 trait EventHandlable{
     fn on_message(&self, msg:UINT,wparam:WPARAM, lparam:LPARAM)->Option<LRESULT>;
     fn connect(&self, handler:WindowEvent);
@@ -117,7 +120,7 @@ impl MouseEvent{
 enum WindowEvent{
     OnPaint(Box<Fn(&Window, &mut PaintEvent)>),
     OnMouseMove(Box<Fn(&Window, &mut MouseEvent)>),
-    OnButtonClick(String, Box<Fn(&Window, &mut Event)>)
+    OnButtonClick(HWND, Box<Fn(&Window, &mut Event)>)
 }
 impl WindowEvent{
     fn paint<T:'static+ Fn(&Window, &mut PaintEvent)>( it:T)->WindowEvent{
@@ -126,8 +129,8 @@ impl WindowEvent{
     fn mousemove<T:'static+ Fn(&Window, &mut MouseEvent)>( it:T)->WindowEvent{
         WindowEvent::OnMouseMove(Box::new(it))
     }
-    fn button_click<T:'static+ Fn(&Window, &mut Event)>(name:&str, f:T)->WindowEvent{
-        WindowEvent::OnButtonClick(String::from(name), Box::new(f))
+    fn button_click<T:'static+ Fn(&Window, &mut Event)>(button:&Button, f:T)->WindowEvent{
+        WindowEvent::OnButtonClick(button.get_hwnd(), Box::new(f))
     }
 }
 struct Window
@@ -206,23 +209,13 @@ impl EventHandlable for Window{
         };
         match msg{
             winapi::winuser::WM_COMMAND=>{
-                let children = self.children.read().unwrap();
-                println!("LINE:let children = self.children.read().unwrap();");
-                for (key, it) in children.iter(){
-                    let h =unsafe{std::mem::transmute::<&Box<Child>, &Box<Button>>(it)};
-                    println!("h is {:x} hwnd is {:x}",h.get_hwnd() as LPARAM, lparam);
-                    if lparam as HWND == h.get_hwnd(){
-                        println!("LINE:if lparam as HWND == h.get_hwnd(){{");
-                        for it in reader.iter(){
-                           match *it{
-                                WindowEvent::OnButtonClick(ref name, ref handler)=>if key == name{
-                                    handler(self, &mut Event{});
-                                    return Some(0);
-                                },
-                                _=>{}
-                            }
-                       }
-                       break;
+                for it in reader.iter(){
+                    match *it{
+                        WindowEvent::OnButtonClick(ref name, ref handler)=>if lparam as HWND == *name{
+                            handler(self, &mut Event{});
+                            return Some(0);
+                        },
+                        _=>{}
                     }
                 }
             },
@@ -633,7 +626,7 @@ fn main() {
             let btn:&Button = window.find_child::<Button>("id_button_1").unwrap();
             btn.set_text(&format!("X:{}, Y:{}",pos.get_x(), pos.get_y()));
         }));
-        window.connect(WindowEvent::button_click("id_button_1",|window, event|{
+        window.connect(WindowEvent::button_click(btn,|window, event|{
             window.show_message("알림","버튼1이 눌렸습니다.");
         }));
     });
